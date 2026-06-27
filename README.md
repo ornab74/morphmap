@@ -1,21 +1,16 @@
-# Worldshard Chess
+# MorphMap
 
-Worldshard Chess is an AI-directed chess saga in which every legal move generates the next scene of a changing world. A local chess engine remains the source of truth while OpenAI models plan the experience, render each board, and independently audit what was rendered.
 
-The playable board stays strict and click-safe. The world around it is allowed to fracture, brighten, decay, or become mythic as the game moves from opening to endgame.
+## Windows Installation
 
-## What It Does
+```powershell
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/ornab74/morphmap/main/install-windows.ps1" -OutFile ".\install-windows.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1 -DesktopShortcut
+```
 
-- Runs legal chess locally, including checks, castling, en passant, promotion, undo, FEN, and PGN.
-- Builds a phase-aware scene brief for every position and move.
-- Generates a new PNG game screen through the OpenAI Images API.
-- Uses an independent vision pass to locate the board, click zones, text, and visible pieces.
-- Compares observed pieces with the local engine before allowing interaction.
-- Marks inaccurate or low-confidence frames as read-only instead of trusting them.
-- Preserves generated scenes in a navigable Chronicle.
-- Exports individual frame metadata or the complete Chronicle as JSON.
-- Optionally lets GPT play Black.
-- Encrypts saved API settings locally with AES-256-GCM.
+
+MorphMap is an AI-directed chess saga in which every legal move generates the next scene of a changing world. A local chess engine remains the source of truth while OpenAI models plan the experience, render each board, and independently audit what was rendered.
+ 
 
 ## How It Works
 
