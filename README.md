@@ -15,12 +15,6 @@ What I think: your idea is **not just “an anti-video game.”** It is closer t
 
 # The Anti-Video Game as a Blackbox Reality Generator
 
-Your pasted concept has two big ideas braided together. First, you are criticizing normal game development loops: visual scripting traps, asset dependence, gatekeeping, platform control, studios taking years to ship, and beginners getting stuck believing that tools alone replace deep understanding. Second, you are imagining a future where a user types a wild game idea into a bare text box, friends critique it, and a swarm of AI systems generates a playable world from that idea: logic, art, sound, assets, characters, rules, and persistent “play shards” that can be shared, voted on, remixed, and funded by the community. 
-
-I think that is a **very strong idea**, but the strongest version is not “AI makes GTA instantly.” The strongest version is:
-
-> **A game that destroys the old idea of a fixed video game and replaces it with a living, player-shaped, AI-generated experience.**
-
 That is the anti-video game.
 
 Not anti-fun.
