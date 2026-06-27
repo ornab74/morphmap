@@ -3,6 +3,19 @@
 
 ## Windows Installation
 
+
+To install open a powershell and then paste this code in to automatically install.
+
+You can also download the repo as a .zip. Unzip. Install python from python's website. run
+```powershell
+python -m pip install -r requirements.txt
+```
+
+then run
+
+```python main.py```
+
+. After the GUI opens
 ```powershell
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/ornab74/morphmap/main/install-windows.ps1" -OutFile ".\install-windows.ps1"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1 -DesktopShortcut
@@ -1296,7 +1309,7 @@ The command uses `ExecutionPolicy Bypass` only for the installer process. It doe
 1. Open **Settings** inside Worldshard Chess.
 2. Enter your OpenAI API key.
 3. Confirm that the configured planner, vision, and image models are available to your OpenAI account.
-4. Choose **Apply in memory**, or choose **Save encrypted** and create a passphrase.
+4. Choose **Apply in memory**, or choose **Save to Vault** and create a passphrase.
 5. Select **Plan + Generate Opening Screen**.
 
 The installer never asks for, transmits, stores, or prints your API key. It only reports whether the `OPENAI_API_KEY` environment variable is present.
@@ -1309,7 +1322,7 @@ The installer never asks for, transmits, stores, or prints your API key. It only
 - Creates an isolated `.venv`; global Python packages are not modified.
 - Upgrades `pip`, `setuptools`, and `wheel` inside the venv.
 - Installs `requirements.txt` and runs `pip check`.
-- Compiles `main.py` and smoke-tests the local chess engine.
+- Compiles `main.py`, smoke-tests the local chess engine, and runs encrypted-vault integration tests.
 - Creates `run-worldshard.cmd` and an optional desktop shortcut.
 - Writes a non-secret `install-state.json` receipt containing version and environment details.
 
@@ -1376,7 +1389,7 @@ Useful installer options:
 | `-RecreateVenv` | Delete and rebuild only the selected venv. |
 | `-ForceSourceRefresh` | Overwrite source from GitHub while preserving the venv. |
 
-Generated scenes and encrypted settings are stored separately under `%USERPROFILE%\.worldshard_chess_secure`. Updating, repairing, or reinstalling the application does not delete that data.
+Generated scenes and the encrypted SQLite vault are stored separately under `%USERPROFILE%\.worldshard_chess_secure`. Updating, repairing, or reinstalling the application does not delete that data.
 
 ### macOS and Linux
 
@@ -1405,7 +1418,7 @@ $env:OPENAI_API_KEY="your-key-here"
 python main.py
 ```
 
-Alternatively, launch the application, open **Settings**, enter the key, and choose **Save encrypted**. The key is encrypted with a passphrase and must be loaded from Settings in future sessions.
+Alternatively, launch the application, open **Settings**, enter the key, and choose **Save to Vault**. The key is encrypted with a passphrase and can be restored later with **Unlock + Load**.
 
 ## Running
 
@@ -1460,18 +1473,29 @@ Generated PNGs and their metadata are written to:
 ~/.worldshard_chess_secure/outputs/
 ```
 
-Encrypted settings are written to:
+The encrypted aiosqlite vault is written to:
 
 ```text
-~/.worldshard_chess_secure/settings.enc.json
+~/.worldshard_chess_secure/worldshard-vault.sqlite3
 ```
 
-Directories are created with user-only permissions where supported. Files are written atomically.
+The vault stores encrypted settings, API credentials, world/rules prompts, session snapshots, frame metadata, image prompts, FEN/PGN, and visual audit results. Generated PNG files remain in `outputs/` with a minimal integrity sidecar containing hashes, dimensions, versions, and quality verdict only. Full frame metadata is written to the encrypted vault while it is unlocked.
+
+The explicit frame and Chronicle export buttons create decrypted plaintext JSON after a confirmation warning. Treat those exports as sensitive files.
+
+Legacy `settings.enc.json` files can be imported from Settings. They are preserved after migration so you can verify the new vault before removing the old file manually.
+
+Directories use user-only permissions where supported. SQLite runs with WAL journaling, full synchronization, foreign keys, busy timeouts, secure deletion, and in-memory temporary storage.
 
 ## Security Model
 
 - API keys are never hardcoded or intentionally stored as plaintext.
-- Saved settings use AES-256-GCM with a PBKDF2-HMAC-SHA256 derived key.
+- `aiosqlite` manages transactions and persistence; sensitive record payloads are encrypted before they reach SQLite.
+- Every encrypted record uses AES-256-GCM, an independent random nonce, and AAD bound to its vault version, record type, and record key.
+- Vault keys are derived with PBKDF2-HMAC-SHA256 using a random salt and 600,000 iterations.
+- The passphrase is never stored. The derived key remains in memory only while the vault is unlocked and is overwritten when locked or when the app closes.
+- Passphrase rotation re-encrypts all records and the vault verification sentinel inside one SQLite transaction.
+- SQLite can reveal limited operational metadata such as record categories, opaque record keys, timestamps, and counts. API keys, prompts, chess state, and frame payloads remain ciphertext.
 - Generated PNG structure, CRCs, dimensions, and size limits are checked before Tk loads an image.
 - Model JSON is bounded, parsed as data, and sanitized before use.
 - Generated code is never executed.
@@ -1489,7 +1513,7 @@ Install your operating system's Tk package, such as `python3-tk` on Debian or Ub
 
 Set `OPENAI_API_KEY` or load an encrypted key through Settings.
 
-### `Install cryptography first`
+### `Install aiosqlite first` or `Install cryptography first`
 
 Activate the project environment and run:
 

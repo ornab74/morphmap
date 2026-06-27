@@ -18,11 +18,11 @@ Run:
 
 API key options:
     1. export OPENAI_API_KEY="your_key"
-    2. Settings -> save/load encrypted local key using AES-256-GCM.
+    2. Settings -> save/load the key in the encrypted aiosqlite vault.
 
 Security model:
     - API key is never hardcoded and never written in plaintext by this app.
-    - Encrypted settings store only salt, nonce, KDF params, and ciphertext.
+    - Vault payloads use per-record AES-256-GCM; SQLite stores ciphertext plus minimal indexing metadata.
     - PNG images are accepted only after strict structure, CRC, byte, dimension,
       and pixel-count validation.
     - Model JSON is parsed through bounded extraction and schema sanitization.
@@ -32,6 +32,7 @@ Security model:
 from __future__ import annotations
 
 import base64
+import asyncio
 import copy
 import hashlib
 import json
@@ -57,6 +58,11 @@ except Exception:  # pragma: no cover
     OpenAI = None
 
 try:
+    import aiosqlite
+except Exception:  # pragma: no cover
+    aiosqlite = None
+
+try:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -66,7 +72,7 @@ except Exception:  # pragma: no cover
     hashes = None
 
 APP_TITLE = "Worldshard Chess: Living Board Saga"
-APP_VERSION = "7.1.0-world-bible"
+APP_VERSION = "8.0.0-encrypted-vault"
 PROMPT_SYSTEM_VERSION = "2.0-world-bible"
 
 Square = Tuple[int, int]
@@ -805,7 +811,7 @@ class ScreenFrame:
 @dataclass
 class AppConfig:
     output_dir: str = field(default_factory=lambda: str(app_base_dir() / "outputs"))
-    settings_path: str = field(default_factory=lambda: str(app_base_dir() / "settings.enc.json"))
+    settings_path: str = field(default_factory=lambda: str(app_base_dir() / "worldshard-vault.sqlite3"))
     llm_model: str = "gpt-5.5"
     image_model: str = "gpt-image-1"
     vision_model: str = "gpt-5.5"
@@ -845,11 +851,11 @@ class AppConfig:
 
 
 # ---------------------------------------------------------------------------
-# AES-GCM secure settings
+# AES-GCM legacy settings and encrypted aiosqlite vault
 # ---------------------------------------------------------------------------
 
 
-class SecureSettingsStore:
+class LegacySecureSettingsStore:
     VERSION = 2
     AAD = b"worldshard-chess-secure-settings-v2"
 
@@ -931,6 +937,442 @@ class SecureSettingsStore:
     def delete(self) -> None:
         if self.path.exists():
             self.path.unlink()
+
+
+class AsyncRuntime:
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.ready = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="worldshard-async-runtime", daemon=True)
+        self.thread.start()
+        if not self.ready.wait(timeout=5):
+            raise RuntimeError("Async database runtime failed to start.")
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.ready.set()
+        self.loop.run_forever()
+
+    def run(self, coroutine: Any, timeout: float = 60.0) -> Any:
+        if not self.thread.is_alive():
+            raise RuntimeError("Async database runtime is not available.")
+        future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        try:
+            return future.result(timeout=timeout)
+        except Exception:
+            future.cancel()
+            raise
+
+    def stop(self) -> None:
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        if self.thread.is_alive():
+            self.thread.join(timeout=3)
+        try:
+            self.loop.close()
+        except Exception:
+            pass
+
+
+class SecureDatabase:
+    VAULT_VERSION = 1
+    KDF_ITERATIONS = 600_000
+    CHECK_AAD = b"worldshard-vault-check-v1"
+    CHECK_PLAINTEXT = b"worldshard-vault-unlocked"
+    MAX_RECORD_BYTES = 4 * 1024 * 1024
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path).expanduser()
+        self._key: Optional[bytearray] = None
+        self._key_guard = threading.RLock()
+        self._operation_lock = asyncio.Lock()
+
+    def available(self) -> bool:
+        return aiosqlite is not None and AESGCM is not None and PBKDF2HMAC is not None and hashes is not None
+
+    @property
+    def unlocked(self) -> bool:
+        with self._key_guard:
+            return self._key is not None
+
+    def lock(self) -> None:
+        with self._key_guard:
+            if self._key is not None:
+                for index in range(len(self._key)):
+                    self._key[index] = 0
+            self._key = None
+
+    def _require_dependencies(self) -> None:
+        if aiosqlite is None:
+            raise RuntimeError("Install aiosqlite first: pip install -r requirements.txt")
+        if AESGCM is None or PBKDF2HMAC is None or hashes is None:
+            raise RuntimeError("Install cryptography first: pip install -r requirements.txt")
+
+    @staticmethod
+    def _derive_key(passphrase: str, salt: bytes, iterations: int) -> bytes:
+        passphrase = sanitize_text(passphrase, 512)
+        if len(passphrase) < 8:
+            raise ValueError("Passphrase must be at least 8 characters.")
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=iterations)
+        return kdf.derive(passphrase.encode("utf-8"))
+
+    def _key_bytes(self) -> bytes:
+        with self._key_guard:
+            if self._key is None:
+                raise PermissionError("Encrypted vault is locked. Unlock it in Settings first.")
+            return bytes(self._key)
+
+    def _set_key(self, key: bytes) -> None:
+        self.lock()
+        with self._key_guard:
+            self._key = bytearray(key)
+
+    def _tighten_permissions(self) -> None:
+        ensure_private_dir(self.path.parent)
+        for candidate in (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")):
+            if candidate.exists():
+                try:
+                    os.chmod(candidate, 0o600)
+                except Exception:
+                    pass
+
+    async def _connect(self) -> Any:
+        self._require_dependencies()
+        ensure_private_dir(self.path.parent)
+        connection = await aiosqlite.connect(str(self.path), timeout=15)
+        await connection.execute("PRAGMA foreign_keys=ON")
+        await connection.execute("PRAGMA busy_timeout=15000")
+        await connection.execute("PRAGMA journal_mode=WAL")
+        await connection.execute("PRAGMA synchronous=FULL")
+        await connection.execute("PRAGMA secure_delete=ON")
+        await connection.execute("PRAGMA temp_store=MEMORY")
+        return connection
+
+    async def initialize(self) -> None:
+        connection = await self._connect()
+        try:
+            await connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS vault_meta (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    vault_version INTEGER NOT NULL,
+                    salt BLOB NOT NULL,
+                    kdf_iterations INTEGER NOT NULL,
+                    check_nonce BLOB NOT NULL,
+                    check_ciphertext BLOB NOT NULL,
+                    created_utc TEXT NOT NULL,
+                    updated_utc TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS secure_records (
+                    record_type TEXT NOT NULL,
+                    record_key TEXT NOT NULL,
+                    nonce BLOB NOT NULL,
+                    ciphertext BLOB NOT NULL,
+                    created_utc TEXT NOT NULL,
+                    updated_utc TEXT NOT NULL,
+                    PRIMARY KEY (record_type, record_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_secure_records_type_updated
+                ON secure_records (record_type, updated_utc DESC);
+                """
+            )
+            await connection.commit()
+        finally:
+            await connection.close()
+            self._tighten_permissions()
+
+    async def unlock(self, passphrase: str, *, create: bool) -> Dict[str, Any]:
+        async with self._operation_lock:
+            return await self._unlock(passphrase, create=create)
+
+    async def _unlock(self, passphrase: str, *, create: bool) -> Dict[str, Any]:
+        self._require_dependencies()
+        existed = self.path.exists()
+        if not existed and not create:
+            raise FileNotFoundError(f"No encrypted vault found: {self.path}")
+        await self.initialize()
+        connection = await self._connect()
+        try:
+            cursor = await connection.execute(
+                "SELECT vault_version, salt, kdf_iterations, check_nonce, check_ciphertext, created_utc "
+                "FROM vault_meta WHERE singleton = 1"
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                if not create:
+                    raise ValueError("Database exists but does not contain an initialized encrypted vault.")
+                salt = secrets.token_bytes(16)
+                iterations = self.KDF_ITERATIONS
+                key = await asyncio.to_thread(self._derive_key, passphrase, salt, iterations)
+                nonce = secrets.token_bytes(12)
+                ciphertext = AESGCM(key).encrypt(nonce, self.CHECK_PLAINTEXT, self.CHECK_AAD)
+                created = utc_now()
+                await connection.execute(
+                    "INSERT INTO vault_meta "
+                    "(singleton, vault_version, salt, kdf_iterations, check_nonce, check_ciphertext, created_utc, updated_utc) "
+                    "VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
+                    (self.VAULT_VERSION, salt, iterations, nonce, ciphertext, created, created),
+                )
+                await connection.commit()
+            else:
+                version, salt, iterations, nonce, ciphertext, created = row
+                if int(version) != self.VAULT_VERSION:
+                    raise RuntimeError(f"Unsupported encrypted vault version: {version}")
+                iterations = safe_int(iterations, self.KDF_ITERATIONS, 200_000, 2_000_000)
+                key = await asyncio.to_thread(self._derive_key, passphrase, bytes(salt), iterations)
+                try:
+                    check = AESGCM(key).decrypt(bytes(nonce), bytes(ciphertext), self.CHECK_AAD)
+                except Exception as exc:
+                    raise ValueError("Incorrect passphrase or corrupted encrypted vault.") from exc
+                if check != self.CHECK_PLAINTEXT:
+                    raise ValueError("Encrypted vault verification failed.")
+            self._set_key(key)
+            return {"created": row is None, "path": str(self.path), "created_utc": created}
+        finally:
+            await connection.close()
+            self._tighten_permissions()
+
+    async def rotate_passphrase(self, new_passphrase: str) -> int:
+        async with self._operation_lock:
+            return await self._rotate_passphrase(new_passphrase)
+
+    async def _rotate_passphrase(self, new_passphrase: str) -> int:
+        old_key = self._key_bytes()
+        new_salt = secrets.token_bytes(16)
+        new_key = await asyncio.to_thread(
+            self._derive_key,
+            new_passphrase,
+            new_salt,
+            self.KDF_ITERATIONS,
+        )
+        connection = await self._connect()
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                "SELECT record_type, record_key, nonce, ciphertext FROM secure_records"
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for record_type, record_key, nonce, ciphertext in rows:
+                aad = self._record_aad(record_type, record_key)
+                plaintext = AESGCM(old_key).decrypt(bytes(nonce), bytes(ciphertext), aad)
+                new_nonce = secrets.token_bytes(12)
+                new_ciphertext = AESGCM(new_key).encrypt(new_nonce, plaintext, aad)
+                await connection.execute(
+                    "UPDATE secure_records SET nonce = ?, ciphertext = ?, updated_utc = ? "
+                    "WHERE record_type = ? AND record_key = ?",
+                    (new_nonce, new_ciphertext, utc_now(), record_type, record_key),
+                )
+
+            check_nonce = secrets.token_bytes(12)
+            check_ciphertext = AESGCM(new_key).encrypt(
+                check_nonce,
+                self.CHECK_PLAINTEXT,
+                self.CHECK_AAD,
+            )
+            await connection.execute(
+                "UPDATE vault_meta SET salt = ?, kdf_iterations = ?, check_nonce = ?, "
+                "check_ciphertext = ?, updated_utc = ? WHERE singleton = 1",
+                (new_salt, self.KDF_ITERATIONS, check_nonce, check_ciphertext, utc_now()),
+            )
+            await connection.commit()
+            self._set_key(new_key)
+            return len(rows)
+        except Exception:
+            await connection.rollback()
+            raise
+        finally:
+            await connection.close()
+            self._tighten_permissions()
+
+    @staticmethod
+    def _record_identity(record_type: str, record_key: str) -> Tuple[str, str]:
+        clean_type = sanitize_text(record_type, 48, one_line=True).lower()
+        clean_key = sanitize_text(record_key, 240, one_line=True)
+        if not re.fullmatch(r"[a-z0-9_.-]{1,48}", clean_type):
+            raise ValueError("Invalid encrypted record type.")
+        if not clean_key:
+            raise ValueError("Encrypted record key cannot be empty.")
+        return clean_type, clean_key
+
+    @classmethod
+    def _record_aad(cls, record_type: str, record_key: str) -> bytes:
+        return f"worldshard-vault-v{cls.VAULT_VERSION}:{record_type}:{record_key}".encode("utf-8")
+
+    def _encrypt_payload(self, record_type: str, record_key: str, payload: Dict[str, Any]) -> Tuple[bytes, bytes]:
+        plaintext = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if len(plaintext) > self.MAX_RECORD_BYTES:
+            raise ValueError("Encrypted database record exceeds the 4 MiB safety limit.")
+        nonce = secrets.token_bytes(12)
+        ciphertext = AESGCM(self._key_bytes()).encrypt(
+            nonce,
+            plaintext,
+            self._record_aad(record_type, record_key),
+        )
+        return nonce, ciphertext
+
+    def _decrypt_payload(self, record_type: str, record_key: str, nonce: bytes, ciphertext: bytes) -> Dict[str, Any]:
+        try:
+            plaintext = AESGCM(self._key_bytes()).decrypt(
+                bytes(nonce),
+                bytes(ciphertext),
+                self._record_aad(record_type, record_key),
+            )
+        except Exception as exc:
+            raise ValueError(f"Encrypted record authentication failed: {record_type}/{record_key}") from exc
+        if len(plaintext) > self.MAX_RECORD_BYTES:
+            raise ValueError("Decrypted database record exceeds the safety limit.")
+        payload = json.loads(plaintext.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Decrypted database record was not an object.")
+        return payload
+
+    async def put_record(self, record_type: str, record_key: str, payload: Dict[str, Any]) -> None:
+        async with self._operation_lock:
+            await self._put_record(record_type, record_key, payload)
+
+    async def _put_record(self, record_type: str, record_key: str, payload: Dict[str, Any]) -> None:
+        record_type, record_key = self._record_identity(record_type, record_key)
+        nonce, ciphertext = self._encrypt_payload(record_type, record_key, payload)
+        timestamp = utc_now()
+        connection = await self._connect()
+        try:
+            await connection.execute(
+                "INSERT INTO secure_records "
+                "(record_type, record_key, nonce, ciphertext, created_utc, updated_utc) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(record_type, record_key) DO UPDATE SET "
+                "nonce=excluded.nonce, ciphertext=excluded.ciphertext, updated_utc=excluded.updated_utc",
+                (record_type, record_key, nonce, ciphertext, timestamp, timestamp),
+            )
+            await connection.commit()
+        finally:
+            await connection.close()
+            self._tighten_permissions()
+
+    async def get_record(self, record_type: str, record_key: str) -> Optional[Dict[str, Any]]:
+        async with self._operation_lock:
+            return await self._get_record(record_type, record_key)
+
+    async def _get_record(self, record_type: str, record_key: str) -> Optional[Dict[str, Any]]:
+        record_type, record_key = self._record_identity(record_type, record_key)
+        connection = await self._connect()
+        try:
+            cursor = await connection.execute(
+                "SELECT nonce, ciphertext, created_utc, updated_utc FROM secure_records "
+                "WHERE record_type = ? AND record_key = ?",
+                (record_type, record_key),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        finally:
+            await connection.close()
+            self._tighten_permissions()
+        if row is None:
+            return None
+        payload = self._decrypt_payload(record_type, record_key, row[0], row[1])
+        payload["_record_key"] = record_key
+        payload["_created_utc"] = row[2]
+        payload["_updated_utc"] = row[3]
+        return payload
+
+    async def list_records(self, record_type: str, limit: int = 100) -> List[Dict[str, Any]]:
+        async with self._operation_lock:
+            return await self._list_records(record_type, limit)
+
+    async def _list_records(self, record_type: str, limit: int = 100) -> List[Dict[str, Any]]:
+        record_type, _ = self._record_identity(record_type, "list")
+        limit = safe_int(limit, 100, 1, 1000)
+        connection = await self._connect()
+        try:
+            cursor = await connection.execute(
+                "SELECT record_key, nonce, ciphertext, created_utc, updated_utc "
+                "FROM secure_records WHERE record_type = ? ORDER BY updated_utc DESC LIMIT ?",
+                (record_type, limit),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        finally:
+            await connection.close()
+            self._tighten_permissions()
+        records: List[Dict[str, Any]] = []
+        for record_key, nonce, ciphertext, created, updated in rows:
+            payload = self._decrypt_payload(record_type, record_key, nonce, ciphertext)
+            payload["_record_key"] = record_key
+            payload["_created_utc"] = created
+            payload["_updated_utc"] = updated
+            records.append(payload)
+        return records
+
+    async def delete_record(self, record_type: str, record_key: str) -> None:
+        async with self._operation_lock:
+            await self._delete_record(record_type, record_key)
+
+    async def _delete_record(self, record_type: str, record_key: str) -> None:
+        record_type, record_key = self._record_identity(record_type, record_key)
+        connection = await self._connect()
+        try:
+            await connection.execute(
+                "DELETE FROM secure_records WHERE record_type = ? AND record_key = ?",
+                (record_type, record_key),
+            )
+            await connection.commit()
+            cursor = await connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            await cursor.fetchall()
+            await cursor.close()
+        finally:
+            await connection.close()
+            self._tighten_permissions()
+
+    async def checkpoint(self) -> None:
+        async with self._operation_lock:
+            await self._checkpoint()
+
+    async def _checkpoint(self) -> None:
+        if not self.path.exists():
+            return
+        connection = await self._connect()
+        try:
+            cursor = await connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            await cursor.fetchall()
+            await cursor.close()
+        finally:
+            await connection.close()
+            self._tighten_permissions()
+
+    async def stats(self) -> Dict[str, int]:
+        async with self._operation_lock:
+            return await self._stats()
+
+    async def _stats(self) -> Dict[str, int]:
+        if not self.path.exists():
+            return {}
+        connection = await self._connect()
+        try:
+            cursor = await connection.execute(
+                "SELECT record_type, COUNT(*) FROM secure_records GROUP BY record_type ORDER BY record_type"
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return {str(record_type): int(count) for record_type, count in rows}
+        finally:
+            await connection.close()
+            self._tighten_permissions()
+
+    async def save_settings(self, settings: Dict[str, Any]) -> None:
+        await self.put_record("settings", "primary", {"settings": settings, "saved_utc": utc_now()})
+
+    async def load_settings(self) -> Dict[str, Any]:
+        record = await self.get_record("settings", "primary")
+        if not record or not isinstance(record.get("settings"), dict):
+            raise FileNotFoundError("Encrypted vault contains no saved settings.")
+        return dict(record["settings"])
+
+    async def delete_settings(self) -> None:
+        await self.delete_record("settings", "primary")
 
 
 # ---------------------------------------------------------------------------
@@ -2050,7 +2492,7 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.title("Secure Settings")
-        self.geometry("760x840")
+        self.geometry("780x900")
         self.configure(bg=BG)
         self.transient(app)
         self.grab_set()
@@ -2066,6 +2508,7 @@ class SettingsDialog(tk.Toplevel):
         self.min_fidelity_var = tk.StringVar(value=str(cfg.min_position_fidelity))
         self.retries_var = tk.StringVar(value=str(cfg.max_vision_retries))
         self.path_var = tk.StringVar(value=cfg.settings_path)
+        self.vault_status_var = tk.StringVar(value=app.vault_status_text())
         self.experience_vars = {
             "auto_generate_after_move": tk.BooleanVar(value=app.auto_var.get()),
             "bot_enabled": tk.BooleanVar(value=app.bot_var.get()),
@@ -2077,8 +2520,9 @@ class SettingsDialog(tk.Toplevel):
             "show_click_indicator": tk.BooleanVar(value=app.overlay_vars["indicator"].get()),
         }
 
-        tk.Label(self, text="SECURE ONLINE SETTINGS", bg=BG, fg=ACCENT, font=("Arial", 16, "bold")).pack(anchor="w", padx=18, pady=(16, 4))
-        tk.Label(self, text="AES-GCM encrypted local storage. API key is used in memory only after loading/applying.", bg=BG, fg=MUTED, wraplength=700, justify="left").pack(anchor="w", padx=18, pady=(0, 12))
+        tk.Label(self, text="ENCRYPTED SQLITE VAULT", bg=BG, fg=ACCENT, font=("Arial", 16, "bold")).pack(anchor="w", padx=18, pady=(16, 4))
+        tk.Label(self, text="aiosqlite persistence with per-record AES-256-GCM authentication. The passphrase-derived key exists only in memory while unlocked.", bg=BG, fg=MUTED, wraplength=730, justify="left").pack(anchor="w", padx=18, pady=(0, 6))
+        tk.Label(self, textvariable=self.vault_status_var, bg=BG, fg=YELLOW, wraplength=730, justify="left").pack(anchor="w", padx=18, pady=(0, 10))
 
         body = tk.Frame(self, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
         body.pack(fill="both", expand=True, padx=18, pady=8)
@@ -2091,7 +2535,7 @@ class SettingsDialog(tk.Toplevel):
         self._entry(body, "Min board confidence", self.min_conf_var)
         self._entry(body, "Min position fidelity", self.min_fidelity_var)
         self._entry(body, "Vision retries", self.retries_var)
-        self._entry(body, "Encrypted settings path", self.path_var)
+        self._entry(body, "Encrypted vault DB path", self.path_var)
 
         experience = tk.LabelFrame(body, text="Experience defaults", bg=PANEL, fg=TEXT, labelanchor="n", highlightbackground=BORDER)
         experience.pack(fill="x", padx=14, pady=(10, 2))
@@ -2123,11 +2567,17 @@ class SettingsDialog(tk.Toplevel):
             ).pack(anchor="w", padx=4, pady=1)
 
         buttons = tk.Frame(body, bg=PANEL)
-        buttons.pack(fill="x", padx=14, pady=16)
+        buttons.pack(fill="x", padx=14, pady=(14, 4))
         self.app.button(buttons, "Apply in memory", self.apply_only).pack(side="left", padx=4)
-        self.app.button(buttons, "Save encrypted", self.save_encrypted).pack(side="left", padx=4)
-        self.app.button(buttons, "Load encrypted", self.load_encrypted).pack(side="left", padx=4)
-        self.app.button(buttons, "Delete encrypted file", self.delete_encrypted).pack(side="right", padx=4)
+        self.app.button(buttons, "Save to Vault", self.save_encrypted).pack(side="left", padx=4)
+        self.app.button(buttons, "Unlock + Load", self.load_encrypted).pack(side="left", padx=4)
+        self.app.button(buttons, "Lock Vault", self.lock_vault).pack(side="right", padx=4)
+
+        vault_buttons = tk.Frame(body, bg=PANEL)
+        vault_buttons.pack(fill="x", padx=14, pady=(4, 10))
+        self.app.button(vault_buttons, "Import Legacy Encrypted JSON", self.import_legacy).pack(side="left", padx=4)
+        self.app.button(vault_buttons, "Rotate Passphrase", self.rotate_passphrase).pack(side="left", padx=4)
+        self.app.button(vault_buttons, "Delete Saved Settings", self.delete_encrypted).pack(side="right", padx=4)
 
         notes = (
             "Validation: model names allow only A-Z, 0-9, dot, dash, underscore, colon, slash. "
@@ -2153,14 +2603,19 @@ class SettingsDialog(tk.Toplevel):
             "min_board_confidence": str(safe_float(self.min_conf_var.get(), 0.65, 0.0, 1.0)),
             "min_position_fidelity": str(safe_float(self.min_fidelity_var.get(), 0.98, 0.0, 1.0)),
             "max_vision_retries": str(safe_int(self.retries_var.get(), 2, 0, 5)),
+            "world_prompt": self.app.get_world_prompt(),
+            "rules_prompt": self.app.get_rules_prompt(),
         }
         data.update({key: var.get() for key, var in self.experience_vars.items()})
         return data
 
-    def store(self) -> SecureSettingsStore:
+    def vault(self) -> SecureDatabase:
         path = sanitize_text(self.path_var.get(), 800, one_line=True) or self.app.config_data.settings_path
         self.app.config_data.settings_path = path
-        return SecureSettingsStore(path)
+        return self.app.configure_database(path)
+
+    def refresh_vault_status(self) -> None:
+        self.vault_status_var.set(self.app.vault_status_text())
 
     def apply_only(self) -> None:
         data = self.collect()
@@ -2178,6 +2633,7 @@ class SettingsDialog(tk.Toplevel):
             setattr(cfg, key, safe_bool(data.get(key), getattr(cfg, key)))
         cfg.settings_path = sanitize_text(self.path_var.get(), 800, one_line=True) or cfg.settings_path
         cfg.sanitize_self()
+        self.app.configure_database(cfg.settings_path)
         self.app.sync_controls_from_config()
         self.app.bridge.refresh_client()
         self.app.refresh_model_labels()
@@ -2186,24 +2642,32 @@ class SettingsDialog(tk.Toplevel):
     def save_encrypted(self) -> None:
         data = self.collect()
         if not data["api_key"]:
-            messagebox.showwarning(APP_TITLE, "Paste an API key before saving encrypted settings.", parent=self)
+            messagebox.showwarning(APP_TITLE, "Paste an API key before saving it to the encrypted vault.", parent=self)
             return
-        passphrase = simpledialog.askstring("Encrypt settings", "Passphrase, minimum 8 characters:", show="*", parent=self)
+        passphrase = simpledialog.askstring("Create or unlock vault", "Vault passphrase, minimum 8 characters:", show="*", parent=self)
         if not passphrase:
             return
         try:
-            self.store().save(data, passphrase)
+            vault = self.vault()
+            result = self.app.vault_runtime.run(vault.unlock(passphrase, create=True), timeout=120)
+            self.app.vault_runtime.run(vault.save_settings(data), timeout=30)
             self.apply_only()
-            messagebox.showinfo(APP_TITLE, "Encrypted settings saved with private file permissions.", parent=self)
+            self.app.persist_existing_chronicle()
+            self.app.update_vault_status()
+            self.refresh_vault_status()
+            created = "created" if result.get("created") else "updated"
+            messagebox.showinfo(APP_TITLE, f"Encrypted SQLite vault {created}. Settings and API key saved.", parent=self)
         except Exception as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
     def load_encrypted(self) -> None:
-        passphrase = simpledialog.askstring("Decrypt settings", "Passphrase:", show="*", parent=self)
+        passphrase = simpledialog.askstring("Unlock encrypted vault", "Vault passphrase:", show="*", parent=self)
         if not passphrase:
             return
         try:
-            data = self.store().load(passphrase)
+            vault = self.vault()
+            self.app.vault_runtime.run(vault.unlock(passphrase, create=False), timeout=120)
+            data = self.app.vault_runtime.run(vault.load_settings(), timeout=30)
             self.key_var.set(str(data.get("api_key", "")))
             self.llm_var.set(str(data.get("llm_model", self.llm_var.get())))
             self.image_var.set(str(data.get("image_model", self.image_var.get())))
@@ -2215,17 +2679,86 @@ class SettingsDialog(tk.Toplevel):
             self.retries_var.set(str(data.get("max_vision_retries", self.retries_var.get())))
             for key, var in self.experience_vars.items():
                 var.set(safe_bool(data.get(key), var.get()))
+            if data.get("world_prompt"):
+                self.app.world_text.delete("1.0", "end")
+                self.app.world_text.insert("1.0", sanitize_text(data.get("world_prompt"), MAX_PROMPT_CHARS))
+            if data.get("rules_prompt"):
+                self.app.rules_text.delete("1.0", "end")
+                self.app.rules_text.insert("1.0", sanitize_text(data.get("rules_prompt"), MAX_PROMPT_CHARS))
             self.apply_only()
-            messagebox.showinfo(APP_TITLE, "Encrypted settings loaded.", parent=self)
+            self.app.persist_existing_chronicle()
+            self.app.update_vault_status()
+            self.refresh_vault_status()
+            messagebox.showinfo(APP_TITLE, "Encrypted vault unlocked and settings loaded.", parent=self)
         except Exception as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
     def delete_encrypted(self) -> None:
-        if not messagebox.askyesno(APP_TITLE, "Delete encrypted settings file?", parent=self):
+        if not messagebox.askyesno(APP_TITLE, "Delete the saved settings/API-key record? Game and frame records remain encrypted in the vault.", parent=self):
             return
         try:
-            self.store().delete()
-            messagebox.showinfo(APP_TITLE, "Encrypted settings deleted.", parent=self)
+            vault = self.vault()
+            if not vault.unlocked:
+                passphrase = simpledialog.askstring("Unlock vault", "Vault passphrase:", show="*", parent=self)
+                if not passphrase:
+                    return
+                self.app.vault_runtime.run(vault.unlock(passphrase, create=False), timeout=120)
+            self.app.vault_runtime.run(vault.delete_settings(), timeout=30)
+            self.key_var.set("")
+            self.app.config_data.api_key = ""
+            self.app.bridge.refresh_client()
+            self.app.update_vault_status()
+            self.refresh_vault_status()
+            messagebox.showinfo(APP_TITLE, "Saved encrypted settings deleted. Other vault records were preserved.", parent=self)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
+    def lock_vault(self) -> None:
+        self.app.lock_vault(clear_api_key=True)
+        self.key_var.set("")
+        self.refresh_vault_status()
+        messagebox.showinfo(APP_TITLE, "Vault locked and in-memory API key cleared.", parent=self)
+
+    def rotate_passphrase(self) -> None:
+        try:
+            vault = self.vault()
+            if not vault.unlocked:
+                current = simpledialog.askstring("Unlock vault", "Current vault passphrase:", show="*", parent=self)
+                if not current:
+                    return
+                self.app.vault_runtime.run(vault.unlock(current, create=False), timeout=120)
+            new_passphrase = simpledialog.askstring("Rotate passphrase", "New passphrase, minimum 8 characters:", show="*", parent=self)
+            if not new_passphrase:
+                return
+            confirmation = simpledialog.askstring("Rotate passphrase", "Confirm new passphrase:", show="*", parent=self)
+            if confirmation != new_passphrase:
+                raise ValueError("New passphrase confirmation did not match.")
+            count = self.app.vault_runtime.run(vault.rotate_passphrase(new_passphrase), timeout=180)
+            self.app.update_vault_status()
+            self.refresh_vault_status()
+            messagebox.showinfo(APP_TITLE, f"Vault passphrase rotated. Re-encrypted {count} record(s).", parent=self)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
+    def import_legacy(self) -> None:
+        legacy_path = app_base_dir() / "settings.enc.json"
+        if not legacy_path.exists():
+            messagebox.showinfo(APP_TITLE, f"No legacy encrypted settings file found:\n{legacy_path}", parent=self)
+            return
+        legacy_passphrase = simpledialog.askstring("Import legacy settings", "Legacy file passphrase:", show="*", parent=self)
+        if not legacy_passphrase:
+            return
+        vault_passphrase = simpledialog.askstring("Create or unlock vault", "Vault passphrase, minimum 8 characters:", show="*", parent=self)
+        if not vault_passphrase:
+            return
+        try:
+            data = LegacySecureSettingsStore(str(legacy_path)).load(legacy_passphrase)
+            vault = self.vault()
+            self.app.vault_runtime.run(vault.unlock(vault_passphrase, create=True), timeout=120)
+            self.app.vault_runtime.run(vault.save_settings(data), timeout=30)
+            self.app.update_vault_status()
+            self.refresh_vault_status()
+            messagebox.showinfo(APP_TITLE, "Legacy settings imported. Use Unlock + Load to apply them. The legacy file was preserved for verification or removal.", parent=self)
         except Exception as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
@@ -2245,6 +2778,9 @@ class WorldshardChessApp(tk.Tk):
 
         self.config_data = AppConfig().sanitize_self()
         ensure_private_dir(Path(self.config_data.output_dir))
+        self.vault_runtime = AsyncRuntime()
+        self.database = SecureDatabase(self.config_data.settings_path)
+        self.session_id = f"session-{now_ms()}-{secrets.token_hex(4)}"
         self.bridge = OpenAIBridge(self.config_data, self.log)
         self.game = ChessGame()
         self.plan: Optional[LLMPlan] = None
@@ -2268,6 +2804,7 @@ class WorldshardChessApp(tk.Tk):
         self.scene_var = tk.StringVar(value="No scene yet.")
         self.vision_summary_var = tk.StringVar(value="No vision summary yet.")
         self.timeline_var = tk.StringVar(value="Chronicle empty")
+        self.vault_var = tk.StringVar(value="Vault: locked")
 
         self.overlay_vars = {
             "clickmap": tk.BooleanVar(value=self.config_data.show_clickmap_overlay),
@@ -2281,8 +2818,11 @@ class WorldshardChessApp(tk.Tk):
         self.auto_var = tk.BooleanVar(value=self.config_data.auto_generate_after_move)
 
         self.build_ui()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.update_vault_status()
         self.log(f"{APP_TITLE} {APP_VERSION}")
         self.log("API-only. PNGs are strict-validated before Tk loads them.")
+        self.log("Encrypted vault: " + self.config_data.settings_path)
 
     def button(self, parent: tk.Widget, text: str, command: Callable[[], None]) -> tk.Button:
         return tk.Button(parent, text=text, command=command, bg=PANEL3, fg=TEXT, activebackground=ACCENT, activeforeground=BG, relief="flat", padx=10, pady=6)
@@ -2344,6 +2884,7 @@ class WorldshardChessApp(tk.Tk):
         tk.Label(model_box, textvariable=self.llm_label_var, bg=PANEL2, fg=PURPLE, anchor="w").pack(fill="x", padx=8, pady=2)
         tk.Label(model_box, textvariable=self.image_label_var, bg=PANEL2, fg=ACCENT, anchor="w").pack(fill="x", padx=8, pady=2)
         tk.Label(model_box, textvariable=self.vision_label_var, bg=PANEL2, fg=GREEN, anchor="w").pack(fill="x", padx=8, pady=2)
+        tk.Label(model_box, textvariable=self.vault_var, bg=PANEL2, fg=YELLOW, anchor="w").pack(fill="x", padx=8, pady=2)
 
     def build_center(self, parent: tk.Frame) -> None:
         top = tk.Frame(parent, bg=BG)
@@ -2400,6 +2941,114 @@ class WorldshardChessApp(tk.Tk):
         self.llm_label_var.set(f"LLM: {self.config_data.llm_model}")
         self.image_label_var.set(f"Image: {self.config_data.image_model} / {self.config_data.image_size} / {self.config_data.image_quality}")
         self.vision_label_var.set(f"Vision: {self.config_data.vision_model}")
+
+    def configure_database(self, path: str) -> SecureDatabase:
+        normalized = str(Path(path).expanduser().resolve())
+        current = str(self.database.path.expanduser().resolve())
+        if normalized != current:
+            if self.database.available() and self.database.path.exists():
+                try:
+                    self.vault_runtime.run(self.database.checkpoint(), timeout=15)
+                except Exception:
+                    pass
+            self.database.lock()
+            self.database = SecureDatabase(normalized)
+            self.config_data.settings_path = normalized
+            self.update_vault_status()
+        return self.database
+
+    def vault_status_text(self) -> str:
+        dependency = "ready" if self.database.available() else "dependencies missing"
+        state = "UNLOCKED" if self.database.unlocked else "LOCKED"
+        record_summary = ""
+        if self.database.available() and self.database.path.exists():
+            try:
+                stats = self.vault_runtime.run(self.database.stats(), timeout=10)
+                record_summary = f" | {sum(stats.values())} record(s)"
+            except Exception:
+                record_summary = " | unreadable/uninitialized"
+        return f"Vault {state} | {dependency}{record_summary} | {self.database.path}"
+
+    def update_vault_status(self) -> None:
+        text = self.vault_status_text()
+        if hasattr(self, "vault_var"):
+            self.vault_var.set(text)
+
+    def lock_vault(self, *, clear_api_key: bool) -> None:
+        if self.database.available() and self.database.path.exists():
+            try:
+                self.vault_runtime.run(self.database.checkpoint(), timeout=15)
+            except Exception as exc:
+                self.log("VAULT WARNING: checkpoint failed before lock: " + sanitize_text(str(exc), 400, one_line=True))
+        self.database.lock()
+        if clear_api_key:
+            self.config_data.api_key = ""
+            self.bridge.refresh_client()
+        self.update_vault_status()
+        self.log("Encrypted vault locked; in-memory key material cleared.")
+
+    def persist_secure_record(self, record_type: str, record_key: str, payload: Dict[str, Any]) -> bool:
+        if not self.database.unlocked:
+            return False
+        try:
+            self.vault_runtime.run(self.database.put_record(record_type, record_key, payload), timeout=30)
+            return True
+        except Exception as exc:
+            self.log("VAULT WARNING: " + sanitize_text(str(exc), 600, one_line=True))
+            return False
+
+    def game_snapshot_payload(self, reason: str) -> Dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "reason": sanitize_text(reason, 80, one_line=True),
+            "saved_utc": utc_now(),
+            "fen": self.game.fen(),
+            "pgn": self.game.pgn(),
+            "status": self.game.status_text(),
+            "ply_count": len(self.game.history),
+            "frame_count": len(self.frames),
+            "world_prompt": self.get_world_prompt(),
+            "rules_prompt": self.get_rules_prompt(),
+            "plan": asdict(self.plan) if self.plan else None,
+        }
+
+    def persist_game_snapshot(self, reason: str) -> None:
+        if not self.database.unlocked:
+            return
+        payload = self.game_snapshot_payload(reason)
+        self.persist_secure_record("session", self.session_id, payload)
+        snapshot_key = f"{self.session_id}:{len(self.game.history):04d}:{now_ms()}:{secrets.token_hex(2)}"
+        self.persist_secure_record("game_snapshot", snapshot_key, payload)
+
+    def persist_frame(self, frame: ScreenFrame) -> bool:
+        record_key = f"{self.session_id}:{frame.index:04d}:{frame.quality.png_sha256[:16]}"
+        return self.persist_secure_record(
+            "frame",
+            record_key,
+            {
+                "session_id": self.session_id,
+                "saved_utc": utc_now(),
+                "frame": self.frame_metadata(frame),
+            },
+        )
+
+    def persist_existing_chronicle(self) -> None:
+        if not self.database.unlocked:
+            return
+        for frame in self.frames:
+            self.persist_frame(frame)
+        self.persist_game_snapshot("chronicle_backfill")
+
+    def on_close(self) -> None:
+        try:
+            self.persist_game_snapshot("application_close")
+            if self.database.available() and self.database.path.exists():
+                self.vault_runtime.run(self.database.checkpoint(), timeout=15)
+        except Exception:
+            pass
+        self.database.lock()
+        self.vault_runtime.stop()
+        self.destroy()
 
     def on_experience_controls_changed(self) -> None:
         cfg = self.config_data
@@ -2536,6 +3185,7 @@ class WorldshardChessApp(tk.Tk):
             self.log("Finish the current generation before starting a new game.")
             return
         self.game.reset()
+        self.session_id = f"session-{now_ms()}-{secrets.token_hex(4)}"
         self.frames.clear()
         self.current_frame = None
         self.frame_cursor = -1
@@ -2554,6 +3204,7 @@ class WorldshardChessApp(tk.Tk):
         self.canvas.create_text(512, 420, text="New game. Generate opening screen.", fill=MUTED, font=("Arial", 22), justify="center")
         self.update_timeline_controls()
         self.log("New game reset.")
+        self.persist_game_snapshot("new_game")
 
     def thread_generate_opening(self) -> None:
         self.run_worker("Generating GPT plan + opening image + vision map...", self.generate_opening)
@@ -2650,8 +3301,9 @@ class WorldshardChessApp(tk.Tk):
             model_vision=self.config_data.vision_model,
             last_action=action,
         )
-        meta = self.frame_metadata(frame)
-        atomic_write_text(path.with_suffix(".json"), json.dumps(meta, indent=2, ensure_ascii=False))
+        encrypted_saved = self.persist_frame(frame)
+        sidecar = self.public_frame_sidecar(frame, encrypted_saved)
+        atomic_write_text(path.with_suffix(".json"), json.dumps(sidecar, indent=2, ensure_ascii=False))
         return frame
 
     def position_audit(self, vision: VisionMap) -> Tuple[float, List[str]]:
@@ -2751,6 +3403,7 @@ class WorldshardChessApp(tk.Tk):
             self.log("RENDER FAILURE: " + failure)
         for warning in frame.quality.warnings:
             self.log("QUALITY WARNING: " + warning)
+        self.persist_game_snapshot("frame_added")
 
     def show_frame(self, frame: ScreenFrame, cursor: int) -> None:
         self.current_frame = frame
@@ -2972,6 +3625,7 @@ class WorldshardChessApp(tk.Tk):
             state_patch={"fen": self.game.fen(), "notation": rec.notation},
         )
         self.log(f"Move made: {rec.notation} / {move_name(move)}")
+        self.persist_game_snapshot("move_made")
         bot_reply = self.bot_var.get() and self.game.turn == "b" and bool(self.game.all_legal_moves("b"))
         self.update_timeline_controls()
         if self.auto_var.get():
@@ -3030,6 +3684,7 @@ class WorldshardChessApp(tk.Tk):
             self.selected_square = None
             self.legal_targets = []
             self.log("Undo move.")
+            self.persist_game_snapshot("move_undone")
             matched_index = self.live_frame_index()
             if matched_index is not None:
                 matched = self.frames[matched_index]
@@ -3063,9 +3718,27 @@ class WorldshardChessApp(tk.Tk):
         data["app_version"] = APP_VERSION
         return data
 
+    def public_frame_sidecar(self, frame: ScreenFrame, encrypted_saved: bool) -> Dict[str, Any]:
+        return {
+            "app_version": APP_VERSION,
+            "frame_index": frame.index,
+            "created_utc": frame.created_utc,
+            "image_file": Path(frame.image_path).name,
+            "image_width": frame.image_width,
+            "image_height": frame.image_height,
+            "png_sha256": frame.quality.png_sha256,
+            "prompt_system_version": frame.prompt_system_version,
+            "prompt_sha256": frame.prompt_sha256,
+            "quality_verdict": "accepted" if frame.quality.accepted else "review",
+            "encrypted_metadata": encrypted_saved,
+            "note": "Full prompt, chess state, and vision metadata are stored only in the encrypted vault when unlocked.",
+        }
+
     def export_metadata(self) -> None:
         if not self.current_frame:
             messagebox.showinfo(APP_TITLE, "No frame to export.")
+            return
+        if not messagebox.askyesno(APP_TITLE, "Export decrypted frame metadata as plaintext JSON? This file can contain prompts and chess state."):
             return
         out_dir = Path(self.config_data.output_dir)
         path = safe_child_path(out_dir, f"export-frame-{self.current_frame.index:04d}-{now_ms()}.json")
@@ -3076,6 +3749,8 @@ class WorldshardChessApp(tk.Tk):
     def export_chronicle(self) -> None:
         if not self.frames:
             messagebox.showinfo(APP_TITLE, "No Chronicle scenes to export.")
+            return
+        if not messagebox.askyesno(APP_TITLE, "Export the decrypted Chronicle as plaintext JSON? This file can contain prompts, chess state, and vision results."):
             return
         out_dir = Path(self.config_data.output_dir)
         path = safe_child_path(out_dir, f"chronicle-{now_ms()}.json")

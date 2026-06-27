@@ -1,5 +1,10 @@
 # OpenAI Responses and Images API client
 openai>=1.68.0,<2.0.0
 
-# AES-256-GCM encrypted local settings
+# Application-layer AES-256-GCM encryption and PBKDF2 key derivation
 cryptography>=42.0.0,<47.0.0
+
+# Async SQLite persistence for encrypted vault records
+aiosqlite>=0.20.0,<1.0.0
+
+# Tkinter is supplied by Python/your OS and is checked by install-windows.ps1.

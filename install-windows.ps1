@@ -352,6 +352,7 @@ try {
     )
     Invoke-Python -Python $Venv -Arguments @("-m", "py_compile", (Join-Path $ProjectRoot "main.py"))
     Invoke-Python -Python $Venv -Arguments @("-c", "import main; assert len(main.ChessGame().all_legal_moves('w')) == 20; print('Worldshard engine smoke test OK')")
+    Invoke-Python -Python $Venv -Arguments @("-m", "unittest", "discover", "-s", (Join-Path $ProjectRoot "tests"), "-v")
 
     Write-Launchers -ProjectRoot $ProjectRoot -VenvDirectory $VenvDirectory
 
