@@ -72,17 +72,15 @@ A normal game says:
 
 > Here is the world. Play inside it.
 
-Your anti-video game says:
+This anti-video game says:
 
 > Tell me the world. Now survive inside what you asked for.
 
-That is fire.
 
 ---
-
-## 2. The Best Version Still Needs Rules, Not Just AI Images
-
-The part I would sharpen is this: frame-by-frame generation alone is not enough.
+# Future Ideas, Concepts, and Utility Suggetions Blerbs
+ 
+The part I still would sharpen is this: frame-by-frame generation alone is not enough.
 
 A game cannot only be a video generator responding to inputs. That would look cool for a while, but it would fall apart unless something underneath tracks reality. Games need persistent state.
 
