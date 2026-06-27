@@ -64,6 +64,124 @@ sudo apt install python3-tk
 
 ## Installation
 
+### Windows 10/11
+
+#### Before you start
+
+You need an internet connection and an OpenAI API key. Use **Windows PowerShell**, not Command Prompt. Administrator privileges are not required.
+
+The installer can find an existing 64-bit Python 3.10+ installation. If Python is missing, it can install 64-bit Python 3.12 for your user account through `winget`.
+
+#### Recommended: one-command installation
+
+1. Open the Start menu.
+2. Search for **PowerShell** and open **Windows PowerShell** normally. Do not choose **Run as administrator**.
+3. Paste the complete command below and press Enter:
+
+```powershell
+curl.exe -fsSL "https://raw.githubusercontent.com/ornab74/morphmap/main/install-windows.ps1" -o "$env:TEMP\worldshard-install.ps1"; if ($LASTEXITCODE -ne 0) { throw "Installer download failed" }; powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\worldshard-install.ps1" -DesktopShortcut
+```
+
+4. Wait until PowerShell prints **Installation complete**. Package installation can take several minutes.
+5. Worldshard Chess launches automatically and a desktop shortcut is created.
+
+This installs the application to:
+
+```text
+%LOCALAPPDATA%\WorldshardChess
+```
+
+The command uses `ExecutionPolicy Bypass` only for the installer process. It does not change the permanent execution policy for Windows or your user account.
+
+#### First launch
+
+1. Open **Settings** inside Worldshard Chess.
+2. Enter your OpenAI API key.
+3. Confirm that the configured planner, vision, and image models are available to your OpenAI account.
+4. Choose **Apply in memory**, or choose **Save encrypted** and create a passphrase.
+5. Select **Plan + Generate Opening Screen**.
+
+The installer never asks for, transmits, stores, or prints your API key. It only reports whether the `OPENAI_API_KEY` environment variable is present.
+
+#### What the installer does
+
+- Downloads source from `https://github.com/ornab74/morphmap` without requiring Git.
+- Uses an existing compatible 64-bit Python or installs Python 3.12 with `winget`.
+- Verifies Tkinter and Tk 8.6+.
+- Creates an isolated `.venv`; global Python packages are not modified.
+- Upgrades `pip`, `setuptools`, and `wheel` inside the venv.
+- Installs `requirements.txt` and runs `pip check`.
+- Compiles `main.py` and smoke-tests the local chess engine.
+- Creates `run-worldshard.cmd` and an optional desktop shortcut.
+- Writes a non-secret `install-state.json` receipt containing version and environment details.
+
+#### Inspect before running
+
+Running any remote script is a trust decision. Download and inspect the installer before executing it if you prefer:
+
+```powershell
+curl.exe -fsSL "https://raw.githubusercontent.com/ornab74/morphmap/main/install-windows.ps1" -o ".\install-windows.ps1"
+notepad .\install-windows.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1 -DesktopShortcut
+```
+
+If `curl.exe` is unavailable, use PowerShell's downloader:
+
+```powershell
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/ornab74/morphmap/main/install-windows.ps1" -OutFile ".\install-windows.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1 -DesktopShortcut
+```
+
+#### Install from a cloned repository
+
+If you already cloned or downloaded `ornab74/morphmap`, open PowerShell in that folder and run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1
+```
+
+In this mode, the script installs into the current repository instead of `%LOCALAPPDATA%\WorldshardChess`.
+
+#### Launch after installation
+
+Use the **Worldshard Chess** desktop shortcut, or run:
+
+```powershell
+& "$env:LOCALAPPDATA\WorldshardChess\run-worldshard.cmd"
+```
+
+For an installation created inside a clone, run `run-worldshard.cmd` from that repository.
+
+#### Update or repair
+
+Update source from GitHub and refresh dependencies:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\WorldshardChess\install-windows.ps1" -ForceSourceRefresh -NoLaunch
+```
+
+Rebuild a damaged virtual environment without replacing source files:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\WorldshardChess\install-windows.ps1" -RecreateVenv -NoLaunch
+```
+
+Useful installer options:
+
+| Option | Purpose |
+| --- | --- |
+| `-InstallDir "D:\Apps\WorldshardChess"` | Choose another installation directory. |
+| `-VenvName ".venv"` | Change the virtual-environment directory name. |
+| `-DesktopShortcut` | Create a desktop shortcut. |
+| `-NoLaunch` | Finish without opening the application. |
+| `-NoPythonInstall` | Fail instead of using `winget` when Python is missing. |
+| `-RecreateVenv` | Delete and rebuild only the selected venv. |
+| `-ForceSourceRefresh` | Overwrite source from GitHub while preserving the venv. |
+
+Generated scenes and encrypted settings are stored separately under `%USERPROFILE%\.worldshard_chess_secure`. Updating, repairing, or reinstalling the application does not delete that data.
+
+### macOS and Linux
+
 Create and activate a virtual environment:
 
 ```bash
@@ -71,12 +189,6 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-```
-
-On Windows PowerShell, activate the environment with:
-
-```powershell
-.venv\Scripts\Activate.ps1
 ```
 
 ## API Key

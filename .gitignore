@@ -1,1 +1,5 @@
-__pycache__/main.cpython-311.pyc
+.venv/
+__pycache__/
+*.py[cod]
+run-worldshard.cmd
+install-state.json
